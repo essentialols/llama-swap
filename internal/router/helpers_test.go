@@ -64,6 +64,11 @@ type fakeProcess struct {
 	// Tests share one recorder across fakes to observe stop ordering.
 	onStop func(id string)
 
+	// lastUse mirrors ProcessCommand.lastUse: unix-nano of the last completed
+	// ServeHTTP, used by the memGate to pick LRU eviction victims. Tests set it
+	// directly to control LRU ordering deterministically.
+	lastUse atomic.Int64
+
 	// inFlightServe counts ServeHTTP calls currently inside the handler.
 	// stoppedWhileServing flips true if Stop is ever called while that
 	// counter is non-zero — a direct, race-free observation of the
@@ -104,6 +109,8 @@ func (f *fakeProcess) State() process.ProcessState {
 }
 
 func (f *fakeProcess) markReady() { f.setState(process.StateReady) }
+
+func (f *fakeProcess) LastUse() int64 { return f.lastUse.Load() }
 
 func (f *fakeProcess) Run(_ time.Duration) error {
 	f.runCalls.Add(1)

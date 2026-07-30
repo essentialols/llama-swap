@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -47,6 +49,55 @@ func TestServer_NewLoggers(t *testing.T) {
 		if len(mux.GetHistory()) != 0 {
 			t.Errorf("muxlog should be empty, got %q", mux.GetHistory())
 		}
+	})
+}
+
+// TestServer_NewLoggers_UpstreamLogFile covers UpstreamLogFileEnv: upstream
+// output must also land in the named file, in every logToStdout mode, without
+// leaking proxy lines into it. The default "proxy" mode is the important case:
+// there the upstream monitor's only other storage is its 100KiB ring buffer.
+func TestServer_NewLoggers_UpstreamLogFile(t *testing.T) {
+	for _, mode := range []string{
+		config.LogToStdoutProxy,
+		config.LogToStdoutBoth,
+		config.LogToStdoutUpstream,
+		config.LogToStdoutNone,
+	} {
+		t.Run(mode, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "upstream.log")
+			t.Setenv(UpstreamLogFileEnv, path)
+
+			_, proxy, upstream := NewLoggers(mode)
+			upstream.Info("UPSTREAMLINE")
+			proxy.Info("PROXYLINE")
+
+			b, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("upstream log file not written: %v", err)
+			}
+			if !strings.Contains(string(b), "UPSTREAMLINE") {
+				t.Errorf("file missing upstream line: %q", b)
+			}
+			if strings.Contains(string(b), "PROXYLINE") {
+				t.Errorf("proxy line leaked into upstream file: %q", b)
+			}
+		})
+	}
+
+	t.Run("unset env writes no file and still builds loggers", func(t *testing.T) {
+		t.Setenv(UpstreamLogFileEnv, "")
+		if sink := upstreamFileSink(); sink != nil {
+			t.Errorf("expected nil sink when env is empty, got %T", sink)
+		}
+	})
+
+	t.Run("unopenable path is non-fatal", func(t *testing.T) {
+		t.Setenv(UpstreamLogFileEnv, filepath.Join(t.TempDir(), "no-such-dir", "upstream.log"))
+		_, _, upstream := NewLoggers(config.LogToStdoutProxy)
+		if upstream == nil {
+			t.Fatal("upstream logger must still be constructed when the file cannot be opened")
+		}
+		upstream.Info("STILLWORKS") // must not panic
 	})
 }
 

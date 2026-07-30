@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/event"
@@ -296,18 +297,44 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// internal/event already has a 50K event buffer
-	// a 1K message buffer should be enough, watch the logs for the warning that the sendBuffer is full
+	// a 1K message buffer should be enough; drops are counted in droppedMsgs
+	// and reported once, after this handler has unsubscribed (see below).
 	sendBuffer := make(chan messageEnvelope, 1024)
+
+	// droppedMsgs counts messages shed because sendBuffer was full or the
+	// connection was already going away. send() is called both from this
+	// handler goroutine (initial payload) and from one consumer.Listen
+	// goroutine per subscription, so this MUST be atomic.
+	var droppedMsgs atomic.Uint64
+
+	// Registered BEFORE the subscription defers so it runs AFTER all of them:
+	// by then this connection is unsubscribed from proxylog, so this single
+	// line cannot feed back into our own send(). See the invariant below.
+	defer func() {
+		if n := droppedMsgs.Load(); n > 0 {
+			s.proxylog.Warnf("handleAPIEvents dropped %d message(s) for a slow/closed SSE client", n)
+		}
+	}()
+
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
+	// INVARIANT: never log from inside send(). This handler subscribes to
+	// s.proxylog (see OnLogData below), so any proxylog write here is itself
+	// broadcast back into send(). When sendBuffer is full that closes a cycle
+	// whose gain is ~2 per connected client, and it self-sustains at the speed
+	// of the synchronous stdout write in logmon.Monitor.Write -- one 11-minute
+	// episode on h1 emitted ~13.2M journal lines (2026-07-29). Shedding the
+	// message silently is what the buffer is for; reconnecting clients are
+	// served from GetHistory(), and logmon already renders its own in-stream
+	// "N bytes dropped" marker. Mirrors handleLogStream's bare `default:`.
 	send := func(msg messageEnvelope) {
 		select {
 		case sendBuffer <- msg:
 		case <-ctx.Done():
-			s.proxylog.Warn("handleAPIEvents send suppressed due to context done")
+			droppedMsgs.Add(1)
 		default:
-			s.proxylog.Warn("handleAPIEvents sendBuffer full, dropped message")
+			droppedMsgs.Add(1)
 		}
 	}
 	sendModels := func() {

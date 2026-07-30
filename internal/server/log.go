@@ -31,25 +31,61 @@ import (
 //   - proxy:    only proxy routed to muxlog -> stdout; upstream discarded
 //
 // An empty or unrecognised value behaves like "proxy".
+//
+// UpstreamLogFileEnv: when set, upstream (llama.cpp) output is ALSO appended to
+// that file, in every logToStdout mode. Without it the upstream monitor's only
+// storage is its in-process 100KiB ring buffer (and io.Discard in the default
+// "proxy" mode), so an upstream crash reason is overwritten within seconds and
+// is unrecoverable afterwards. Rotate the file externally with logrotate
+// `copytruncate` (this writer appends and never reopens).
+const UpstreamLogFileEnv = "LLAMA_SWAP_UPSTREAM_LOG_FILE"
+
+// upstreamFileSink opens the append-only upstream log file named by
+// UpstreamLogFileEnv. It returns nil when the variable is unset or the file
+// cannot be opened: persisting upstream logs is best-effort and must never
+// prevent the proxy from starting.
+func upstreamFileSink() io.Writer {
+	path := strings.TrimSpace(os.Getenv(UpstreamLogFileEnv))
+	if path == "" {
+		return nil
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "llama-swap: cannot open %s=%q for upstream logs: %v\n", UpstreamLogFileEnv, path, err)
+		return nil
+	}
+	return f
+}
+
+// tee returns w when no file sink is configured, otherwise a writer that
+// duplicates into both.
+func tee(w io.Writer, sink io.Writer) io.Writer {
+	if sink == nil {
+		return w
+	}
+	return io.MultiWriter(w, sink)
+}
+
 func NewLoggers(logToStdout string) (muxlog, proxylog, upstreamlog *logmon.Monitor) {
+	sink := upstreamFileSink()
 	switch logToStdout {
 	case config.LogToStdoutNone:
 		muxlog = logmon.NewWriter(io.Discard)
 		proxylog = logmon.NewWriter(io.Discard)
-		upstreamlog = logmon.NewWriter(io.Discard)
+		upstreamlog = logmon.NewWriter(tee(io.Discard, sink))
 	case config.LogToStdoutBoth:
 		muxlog = logmon.NewWriter(os.Stdout)
 		proxylog = logmon.NewWriter(muxlog)
-		upstreamlog = logmon.NewWriter(muxlog)
+		upstreamlog = logmon.NewWriter(tee(muxlog, sink))
 	case config.LogToStdoutUpstream:
 		muxlog = logmon.NewWriter(os.Stdout)
 		proxylog = logmon.NewWriter(io.Discard)
-		upstreamlog = logmon.NewWriter(muxlog)
+		upstreamlog = logmon.NewWriter(tee(muxlog, sink))
 	default:
 		// config.LogToStdoutProxy, and the fallback for an unset value.
 		muxlog = logmon.NewWriter(os.Stdout)
 		proxylog = logmon.NewWriter(muxlog)
-		upstreamlog = logmon.NewWriter(io.Discard)
+		upstreamlog = logmon.NewWriter(tee(io.Discard, sink))
 	}
 	return muxlog, proxylog, upstreamlog
 }
